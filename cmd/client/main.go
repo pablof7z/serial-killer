@@ -776,6 +776,7 @@ func normalizeURL(url string) string {
 func parseCommandArgs(args []string) (kind nostr.Kind, chainName string, content string) {
 	kind = 1
 	var rest []string
+	hasNamedArgs := false
 	for _, arg := range args {
 		k, v, ok := strings.Cut(arg, "=")
 		if !ok {
@@ -786,27 +787,31 @@ func parseCommandArgs(args []string) (kind nostr.Kind, chainName string, content
 		case "kind":
 			if n, err := strconv.Atoi(v); err == nil && n >= 0 && n != 5 {
 				kind = nostr.Kind(n)
+				hasNamedArgs = true
 			} else {
 				rest = append(rest, arg)
 			}
 		case "chain":
 			chainName = v
+			hasNamedArgs = true
 		default:
 			rest = append(rest, arg)
 		}
 	}
-	// Positional chain name: first non-numeric remaining arg when chain not set
-	if chainName == "" && len(rest) > 0 {
-		if _, err := strconv.Atoi(rest[0]); err != nil {
-			chainName = rest[0]
-			rest = rest[1:]
+	if !hasNamedArgs {
+		// Positional chain name: first non-numeric remaining arg when chain not set
+		if chainName == "" && len(rest) > 0 {
+			if _, err := strconv.Atoi(rest[0]); err != nil {
+				chainName = rest[0]
+				rest = rest[1:]
+			}
 		}
-	}
-	// Positional kind: first numeric remaining arg when kind not set via key=value
-	if len(rest) > 0 {
-		if n, err := strconv.Atoi(rest[0]); err == nil && n >= 0 && n != 5 {
-			kind = nostr.Kind(n)
-			rest = rest[1:]
+		// Positional kind: first numeric remaining arg
+		if len(rest) > 0 {
+			if n, err := strconv.Atoi(rest[0]); err == nil && n >= 0 && n != 5 {
+				kind = nostr.Kind(n)
+				rest = rest[1:]
+			}
 		}
 	}
 	content = strings.Join(rest, " ")
