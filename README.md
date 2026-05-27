@@ -16,7 +16,7 @@ A supporting relay maintains exactly one active head per `(pubkey, C)` pair and 
 
 This repo contains:
 
-- **`cmd/relay`** — a [Khatru](https://github.com/fiatjaf/khatru)-based Nostr relay with NIP-FF enforcement and BoltDB persistence
+- **`cmd/relay`** — a Nostr relay that enforces chain ordering, persists events to disk, and filters tombstoned events from query results
 - **`cmd/client`** — an interactive REPL client for creating, querying, and reconciling chains across relays
 
 ## Chain format
@@ -159,19 +159,19 @@ just test          # unit tests
 ## Architecture
 
 ```
-cmd/relay/main.go          relay entry point; wraps Khatru with chain hooks
+cmd/relay/main.go          relay entry point
 cmd/client/main.go         readline REPL; chain reconstruction and reconciliation
 internal/chain/state.go    chain state machine (head tracking, tombstoning, atomic accept)
 chain_test.go              integration tests against a live in-process relay
 ```
 
-The relay wraps three Khatru hooks:
+The relay intercepts three operations:
 
-- **StoreEvent** — validates chain tags and atomically updates the head
-- **QueryStored** — filters tombstoned events from query results
-- **DeleteEvent** — tombstones chain events instead of physically removing them
+- **On publish** — validates chain tags and atomically checks `prev == head` before accepting; rejects stale or malformed events
+- **On query** — filters tombstoned events so deleted chain history is never surfaced to clients
+- **On deletion** — tombstones chain events rather than removing them, then rewinds the head to the nearest active ancestor
 
-On startup the relay rebuilds chain state from BoltDB, so it survives restarts.
+On startup the relay reconstructs chain state from stored events, so heads survive restarts.
 
 ## NIP-FF relay advertisement
 

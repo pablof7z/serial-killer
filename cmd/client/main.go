@@ -740,7 +740,7 @@ func getBranchSuffix(events []nostr.Event, afterID string) []nostr.Event {
 
 func normalizeURL(url string) string {
 	if !strings.HasPrefix(url, "ws://") && !strings.HasPrefix(url, "wss://") {
-		url = "ws://" + url
+		url = "wss://" + url
 	}
 	return nostr.NormalizeURL(url)
 }
