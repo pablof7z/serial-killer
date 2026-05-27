@@ -69,7 +69,7 @@ The relay MUST remember deletions and MUST NOT reactivate a deleted event if it 
 
 # Relay advertisement
 
-Relays implementing this NIP SHOULD include `"FF"` in their NIP-11 supported NIPs list. A relay MUST NOT advertise support unless it also honors NIP-09 deletions for chain events.
+Relays implementing this NIP SHOULD include `"EC"` in their NIP-11 supported NIPs list. A relay MUST NOT advertise support unless it also honors NIP-09 deletions for chain events.
 
 ---
 

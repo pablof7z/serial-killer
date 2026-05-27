@@ -26,7 +26,7 @@ func main() {
 	relay.Info.Software = "https://github.com/fiatjaf/khatru"
 	relay.Info.Version = "0.1.0"
 	relay.Info.AddSupportedNIP(9) // Deletions
-	relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, "FF") // Chain enforcement
+	relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, "EC") // Chain enforcement
 
 	defaultPort := os.Getenv("PORT")
 	if defaultPort == "" {
@@ -183,7 +183,7 @@ func main() {
 
 	// Start HTTP server
 	fmt.Printf("Chain-enforced relay running on :%s\n", port)
-	fmt.Println("Supported NIPs: 1, 9, 11, 42, 70, 86, FF")
+	fmt.Println("Supported NIPs: 1, 9, 11, 42, 70, 86, EC")
 	if err := http.ListenAndServe(":"+port, relay); err != nil {
 		fmt.Printf("server error: %v\n", err)
 	}

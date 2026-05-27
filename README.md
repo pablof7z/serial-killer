@@ -2,39 +2,143 @@
 
 A Nostr relay implementing **NIP-EC** — relay-enforced linear event chains.
 
-## What problem does this solve?
+**The problem:** Nostr clients that maintain ordered state (wallets, document history) have no way to prevent conflicting writes. Two clients can publish different "next states", and relays silently diverge.
 
-Nostr applications that maintain ordered state (wallets, document history, ledgers) have no way to prevent conflicting writes. Two clients can publish different "next states" simultaneously, and different relays may end up with different histories. There is no protocol-level way to detect or prevent this.
+**The fix:** Tag your events with `["chain"]` to opt in. The relay accepts a new event only if its `["prev"]` matches the current head. Stale writes are rejected. No silent forks.
 
-This relay enforces that every chain has exactly one active head. A new event is only accepted if it correctly references that head. If two clients write concurrently, one wins and the other is told the head has moved. No silent forks.
+---
 
-## How it works for clients
+## Demo: divergence and recovery
 
-Tag your events with `["chain"]` and `["C", "<chain-name>"]` to opt into enforcement.
+### Start two relays
 
-The relay will:
+```bash
+$ just run-relays
+```
 
-- **Accept a genesis event** if no chain exists yet for that `(pubkey, C)`
-- **Accept an append event** only if its `["prev", "<id>"]` matches the relay's current head
-- **Reject stale writes** with `stale-prev` so the client knows to fetch the latest head and retry
-- **Reject forks** — only one branch can ever be active
-- **Honor deletions** — deleting a chain event rolls the head back to the nearest surviving ancestor
+```
+Rebuilt chain state from 0 chain events
+Chain-enforced relay running on :3334
+Supported NIPs: 1, 9, 11, 42, 70, 86, EC
+Rebuilt chain state from 0 chain events
+Chain-enforced relay running on :3335
+Supported NIPs: 1, 9, 11, 42, 70, 86, EC
+```
 
-Deleted events stay deleted. A relay syncing a deleted event later cannot resurrect it.
+### Connect and create a genesis event
+
+Connect to both relays and publish the first event of a chain. Both relays accept it.
+
+```
+> connect ws://localhost:3334
+Connected to ws://localhost:3334
+> connect ws://localhost:3335
+Connected to ws://localhost:3335
+> genesis chain=wallet First balance state
+Publishing event f1274080bce22c3c0838c34f5587ce294bd6fde8dd0273a8b67f2fd38eb2f95f to 2 relay(s)...
+  [ws://localhost:3334] OK
+  [ws://localhost:3335] OK
+```
+
+### Query both relays
+
+Both relays have the same genesis event.
+
+```
+> query-all wallet
+
+=== Relay: ws://localhost:3334
+G f1274080bce22c3c... (kind=1, content="First balance state")
+
+=== Relay: ws://localhost:3335
+G f1274080bce22c3c... (kind=1, content="First balance state")
+```
+
+### Simulate divergence
+
+Disconnect from relay-b, then append. Only relay-a advances.
+
+```
+> disconnect ws://localhost:3335
+Disconnected from ws://localhost:3335 (connection may persist in pool)
+> append chain=wallet Second state (relay-a only)
+Publishing event eaa6391967095684d8d890dc6f25528da0a9e9e5a9c74404f401caf7282ea195 to 1 relay(s)...
+  [ws://localhost:3334] OK
+```
+
+Reconnect to relay-b and attempt another append. Relay-a accepts (prev matches its head), but relay-b rejects — it missed an event and its head is behind.
+
+```
+> connect ws://localhost:3335
+Connected to ws://localhost:3335
+> append chain=wallet Third state
+Publishing event 91dee37814364a53861425384c4626058804f521d28e0ea19b471dab63cee942 to 2 relay(s)...
+  [ws://localhost:3335] FAILED: msg: invalid: chain:stale-prev current=f1274080bce22c3c0838c34f5587ce294bd6fde8dd0273a8b67f2fd38eb2f95f
+  [ws://localhost:3334] OK
+```
+
+The chains have diverged. Relay-b is stuck at the genesis while relay-a has advanced two events ahead.
+
+```
+> query-all wallet
+
+=== Relay: ws://localhost:3335
+G f1274080bce22c3c... (kind=1, content="First balance state")
+
+=== Relay: ws://localhost:3334
+G f1274080bce22c3c... (kind=1, content="First balance state")
+  eaa6391967095684... (kind=1, content="Second state (relay-a only)")
+H 91dee37814364a53... (kind=1, content="Third state")
+```
+
+### Inspect the divergence
+
+```
+> diverge wallet
+Checking divergence for chain 'wallet'...
+
+DIVERGENCE between ws://localhost:3334 and ws://localhost:3335
+  Last common: f1274080bce22c3c0838c34f5587ce294bd6fde8dd0273a8b67f2fd38eb2f95f
+  Branch A: eaa6391967095684d8d890dc6f25528da0a9e9e5a9c74404f401caf7282ea195 -> 91dee37814364a53861425384c4626058804f521d28e0ea19b471dab63cee942
+```
+
+Relay-a is ahead by 2 events. Relay-b has no divergent branch — it simply never received the events.
+
+### Reconcile
+
+The `fix` command replays the canonical relay's missing events onto the diverged one.
+
+```
+> fix ws://localhost:3335 wallet ws://localhost:3334
+Last common event: f1274080bce22c3c0838c34f5587ce294bd6fde8dd0273a8b67f2fd38eb2f95f
+Replaying 2 event(s) to target relay...
+  Replayed eaa6391967095684d8d890dc6f25528da0a9e9e5a9c74404f401caf7282ea195
+  Replayed 91dee37814364a53861425384c4626058804f521d28e0ea19b471dab63cee942
+Done.
+> query-all wallet
+
+=== Relay: ws://localhost:3335
+G f1274080bce22c3c... (kind=1, content="First balance state")
+  eaa6391967095684... (kind=1, content="Second state (relay-a only)")
+H 91dee37814364a53... (kind=1, content="Third state")
+
+=== Relay: ws://localhost:3334
+G f1274080bce22c3c... (kind=1, content="First balance state")
+  eaa6391967095684... (kind=1, content="Second state (relay-a only)")
+H 91dee37814364a53... (kind=1, content="Third state")
+```
+
+Both relays are now in sync.
+
+---
 
 ## Chain event format
 
-**Genesis** (starts a new chain):
+**Genesis** (starts a chain):
 
 ```json
 {
-  "kind": 17375,
-  "pubkey": "<pubkey>",
-  "tags": [
-    ["chain"],
-    ["C", "nip60"]
-  ],
-  "content": "..."
+  "tags": [["chain"], ["d", "wallet"]]
 }
 ```
 
@@ -42,95 +146,42 @@ Deleted events stay deleted. A relay syncing a deleted event later cannot resurr
 
 ```json
 {
-  "kind": 7375,
-  "pubkey": "<pubkey>",
-  "tags": [
-    ["chain"],
-    ["C", "nip60"],
-    ["prev", "<current-head-id>"]
-  ],
-  "content": "..."
+  "tags": [["chain"], ["d", "wallet"], ["prev", "<current-head-id>"]]
 }
 ```
 
-Event kind is not part of the chain identity — different kinds can appear in the same chain.
+If no `["d"]` tag is present, the chain name defaults to the event kind as a string.
 
-### Querying
+## Opting out
 
-```json
-["REQ", "<sub-id>", {
-  "authors": ["<pubkey>"],
-  "#C": ["nip60"]
-}]
-```
-
-The relay returns only active (non-deleted) events. Reconstruct the chain by following `prev` tags from head to genesis.
-
-### Chain name namespacing
-
-| Good | Bad |
-|------|-----|
-| `nip60` | `state` |
-| `myapp:v1:user-state` | `default` |
-| `cashu:<mint-pubkey>` | `main` |
-
-Since kind is not part of the chain key, generic names cause real collisions.
+To dissolve a chain, publish an event for the same key with `["prev", "<current-head>"]` but without `["chain"]`. The relay accepts it and removes chain enforcement — subsequent events no longer need `prev`.
 
 ## Deletion and rollback
 
-Send a standard NIP-09 kind-5 event referencing the chain event by `e` tag.
-
-```
-A -> B -> C -> D   (delete B)   =>   A
-```
-
-Deleting any event in the chain rewinds the head to the nearest surviving ancestor and invalidates everything after the deleted event.
-
-## Diverged relays
-
-Two relays that accepted different writes after the same head are both internally valid — the relay has no way to resolve this on its own. The application decides which branch wins and reconciles manually:
-
-1. Fetch both chains, find the last common event
-2. Delete the losing suffix from the diverged relay
-3. Replay the winning events to the diverged relay in order
-
-The included client has `diverge` and `fix` commands for this.
+Send a standard NIP-09 kind-5 event referencing the chain head by `e` tag. The head rewinds to the deleted event's `prev`. Deleted events cannot be reactivated.
 
 ## Running
 
-**Requirements:** Go 1.25+, [just](https://github.com/casey/just)
+**Requirements:** Go 1.21+, [just](https://github.com/casey/just)
 
 ```sh
-just build-all   # compile relay and client
-just run-relay   # start relay on port 3334
-just run-client  # start interactive client
+just build-all    # compile relay and client
+just run-relay    # start relay on :3334
+just run-relays   # start two relays on :3334 and :3335
+just run-client   # start interactive REPL
+just test         # run tests
 ```
 
-To test divergence locally:
-
-```sh
-just run-relays  # starts two relays on ports 3334 and 3335
-```
-
-### Client commands
+### REPL commands
 
 ```
-key [hex]                           show or set private key
-connect <url>                       connect to a relay
-disconnect <url>                    disconnect
-relays                              list connected relays
-genesis <chain> [kind] <content>    start a new chain
-append <chain> [kind] <content>     extend the chain
-query <relay-url> <chain>           show chain from one relay
-query-all <chain>                   show chain from all relays
-diverge <chain>                     detect divergence across relays
-fix <relay-url> <chain> <canonical> reconcile a diverged relay
-delete <relay-url> <chain> <event>  delete a chain event
-```
-
-## Tests
-
-```sh
-just test          # unit tests
-./test_repl.sh     # end-to-end: genesis -> divergence -> fix across two relays
+connect <url>                         connect to a relay
+disconnect <url>                      disconnect
+relays                                list connected relays
+genesis [chain=NAME] [kind=N] <text>  start a new chain
+append  [chain=NAME] [kind=N] <text>  extend the chain
+query-all <chain>                     show chain from all connected relays
+diverge <chain>                       detect divergence across relays
+fix <relay> <chain> <canonical>       reconcile a diverged relay
+delete <relay> <chain> <event-id>     delete a chain event
 ```

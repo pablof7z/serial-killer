@@ -203,14 +203,14 @@ func (cs *ClientState) handleConnect(args []string) {
 		fmt.Printf("%s: could not fetch NIP-11: %v\n", c(yellow, "Warning"), err)
 		return
 	}
-	hasFF := false
+	hasEC := false
 	for _, nip := range info.SupportedNIPs {
-		if nip == "FF" {
-			hasFF = true
+		if nip == "EC" {
+			hasEC = true
 			break
 		}
 	}
-	if !hasFF {
+	if !hasEC {
 		fmt.Printf("%s: relay does not advertise NIP-EC support (chain enforcement may not work)\n", c(yellow, "Warning"))
 	}
 }
