@@ -1,36 +1,30 @@
 # serial-killer
 
-A Nostr relay and client implementing **NIP-FF** — relay-enforced linear event chains.
+A Nostr relay implementing **NIP-FF** — relay-enforced linear event chains.
 
-## What is this?
+## What problem does this solve?
 
-Nostr applications that need ordered, linear state (e.g. a wallet's token history) face a fundamental problem: two clients can publish conflicting next states, and different relays may see different branches. There is no protocol-level truth.
+Nostr applications that maintain ordered state (wallets, document history, ledgers) have no way to prevent conflicting writes. Two clients can publish different "next states" simultaneously, and different relays may end up with different histories. There is no protocol-level way to detect or prevent this.
 
-NIP-FF solves this with one primitive:
+This relay enforces that every chain has exactly one active head. A new event is only accepted if it correctly references that head. If two clients write concurrently, one wins and the other is told the head has moved. No silent forks.
 
-```
-accept event iff prev == current active head
-```
+## How it works for clients
 
-A supporting relay maintains exactly one active head per `(pubkey, C)` pair and atomically validates each new event against it. If two clients race to append, one wins and the other gets a `stale-prev` rejection.
+Tag your events with `["chain"]` and `["C", "<chain-name>"]` to opt into enforcement.
 
-This repo contains:
+The relay will:
 
-- **`cmd/relay`** — a Nostr relay that enforces chain ordering, persists events to disk, and filters tombstoned events from query results
-- **`cmd/client`** — an interactive REPL client for creating, querying, and reconciling chains across relays
+- **Accept a genesis event** if no chain exists yet for that `(pubkey, C)`
+- **Accept an append event** only if its `["prev", "<id>"]` matches the relay's current head
+- **Reject stale writes** with `stale-prev` so the client knows to fetch the latest head and retry
+- **Reject forks** — only one branch can ever be active
+- **Honor deletions** — deleting a chain event rolls the head back to the nearest surviving ancestor
 
-## Chain format
+Deleted events stay deleted. A relay syncing a deleted event later cannot resurrect it.
 
-A chain event carries two required tags:
+## Chain event format
 
-```json
-["chain"]
-["C", "<chain-name>"]
-```
-
-The chain is identified by `(pubkey, C)`. Event kind is **not** part of the identity — different kinds can coexist in the same chain.
-
-**Genesis event** (no `prev`):
+**Genesis** (starts a new chain):
 
 ```json
 {
@@ -38,13 +32,13 @@ The chain is identified by `(pubkey, C)`. Event kind is **not** part of the iden
   "pubkey": "<pubkey>",
   "tags": [
     ["chain"],
-    ["C", "nip60:wallet:<wallet-id>"]
+    ["C", "nip60"]
   ],
   "content": "..."
 }
 ```
 
-**Append event** (must reference current head):
+**Append** (extends the chain):
 
 ```json
 {
@@ -52,127 +46,91 @@ The chain is identified by `(pubkey, C)`. Event kind is **not** part of the iden
   "pubkey": "<pubkey>",
   "tags": [
     ["chain"],
-    ["C", "nip60:wallet:<wallet-id>"],
-    ["prev", "<previous-event-id>"]
+    ["C", "nip60"],
+    ["prev", "<current-head-id>"]
   ],
   "content": "..."
 }
 ```
 
-The relay rejects any event whose `prev` does not match the current active head.
+Event kind is not part of the chain identity — different kinds can appear in the same chain.
+
+### Querying
+
+```json
+["REQ", "<sub-id>", {
+  "authors": ["<pubkey>"],
+  "#C": ["nip60"]
+}]
+```
+
+The relay returns only active (non-deleted) events. Reconstruct the chain by following `prev` tags from head to genesis.
 
 ### Chain name namespacing
 
-Use descriptive, collision-resistant names:
-
 | Good | Bad |
 |------|-----|
-| `nip60:wallet:<wallet-id>` | `state` |
+| `nip60` | `state` |
 | `myapp:v1:user-state` | `default` |
-| `cashu:<mint-pubkey>:wallet:<wallet-id>` | `main` |
+| `cashu:<mint-pubkey>` | `main` |
 
-## NIP-09 deletion and rollback
+Since kind is not part of the chain key, generic names cause real collisions.
 
-A supporting relay **must** honor NIP-09 deletion requests for chain events.
+## Deletion and rollback
 
-- Deleting the head rewinds to the previous active event
-- Deleting an ancestor tombstones it and all descendants; head rewinds to the nearest active ancestor
-- Tombstoned events are never reactivated (prevents resurrection of rolled-back branches)
+Send a standard NIP-09 kind-5 event referencing the chain event by `e` tag.
 
 ```
 A -> B -> C -> D   (delete B)   =>   A
 ```
 
-## Multi-relay divergence
+Deleting any event in the chain rewinds the head to the nearest surviving ancestor and invalidates everything after the deleted event.
 
-Two relays can diverge if clients write to them independently:
+## Diverged relays
 
-```
-Relay A: G -> H -> X
-Relay B: G -> H -> Y
-```
+Two relays that accepted different writes after the same head are both internally valid — the relay has no way to resolve this on its own. The application decides which branch wins and reconciles manually:
 
-Both are internally valid. The application decides which branch wins.
+1. Fetch both chains, find the last common event
+2. Delete the losing suffix from the diverged relay
+3. Replay the winning events to the diverged relay in order
 
-To reconcile (choosing relay A as canonical):
+The included client has `diverge` and `fix` commands for this.
 
-1. **Delete the losing suffix** on relay B — publish a kind-5 event deleting `Y`
-2. **Replay the winning suffix** — publish the original signed `X` to relay B
-
-```
-Relay A: G -> H -> X
-Relay B: G -> H -> X   ✓
-```
-
-The client's `diverge` and `fix` commands automate this workflow.
-
-## Getting started
+## Running
 
 **Requirements:** Go 1.25+, [just](https://github.com/casey/just)
 
 ```sh
-# Build both binaries
-just build-all
+just build-all   # compile relay and client
+just run-relay   # start relay on port 3334
+just run-client  # start interactive client
+```
 
-# Start two relays on ports 3334 and 3335 (for testing divergence)
-just run-relays
+To test divergence locally:
 
-# Start the interactive client
-just run-client
+```sh
+just run-relays  # starts two relays on ports 3334 and 3335
 ```
 
 ### Client commands
 
 ```
 key [hex]                           show or set private key
-connect <url>                       connect to a relay (checks for NIP-FF support)
-disconnect <url>                    disconnect from a relay
+connect <url>                       connect to a relay
+disconnect <url>                    disconnect
 relays                              list connected relays
-genesis <chain> [kind] <content>    create the first event in a chain
-append <chain> [kind] <content>     append to the chain head
-query <relay-url> <chain>           fetch and display a chain from one relay
-query-all <chain>                   fetch from all connected relays
+genesis <chain> [kind] <content>    start a new chain
+append <chain> [kind] <content>     extend the chain
+query <relay-url> <chain>           show chain from one relay
+query-all <chain>                   show chain from all relays
 diverge <chain>                     detect divergence across relays
-fix <relay-url> <chain> <canonical> reconcile a diverged relay against canonical
-delete <relay-url> <chain> <event>  tombstone an event (NIP-09)
+fix <relay-url> <chain> <canonical> reconcile a diverged relay
+delete <relay-url> <chain> <event>  delete a chain event
 ```
 
-### Example session
-
-```
-> connect ws://localhost:3334
-> connect ws://localhost:3335
-> genesis wallet:test "initial state"
-> append wallet:test "second state"
-> query-all wallet:test
-> diverge wallet:test
-> fix ws://localhost:3335 wallet:test ws://localhost:3334
-```
-
-## Running tests
+## Tests
 
 ```sh
 just test          # unit tests
 ./test_repl.sh     # end-to-end: genesis -> divergence -> fix across two relays
 ```
-
-## Architecture
-
-```
-cmd/relay/main.go          relay entry point
-cmd/client/main.go         readline REPL; chain reconstruction and reconciliation
-internal/chain/state.go    chain state machine (head tracking, tombstoning, atomic accept)
-chain_test.go              integration tests against a live in-process relay
-```
-
-The relay intercepts three operations:
-
-- **On publish** — validates chain tags and atomically checks `prev == head` before accepting; rejects stale or malformed events
-- **On query** — filters tombstoned events so deleted chain history is never surfaced to clients
-- **On deletion** — tombstones chain events rather than removing them, then rewinds the head to the nearest active ancestor
-
-On startup the relay reconstructs chain state from stored events, so heads survive restarts.
-
-## NIP-FF relay advertisement
-
-A relay supporting this NIP advertises `"FF"` in its NIP-11 supported NIPs list. The client warns if a relay does not advertise NIP-FF support.
