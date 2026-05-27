@@ -24,8 +24,8 @@ func main() {
 	relay.Info.Description = "A khatru relay with chain-enforced event ordering"
 	relay.Info.Software = "https://github.com/fiatjaf/khatru"
 	relay.Info.Version = "0.1.0"
-	relay.Info.AddSupportedNIP(9)   // Deletions
-	relay.Info.AddSupportedNIP(50) // Chain enforcement (proposed)
+	relay.Info.AddSupportedNIP(9) // Deletions
+	relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, "FF") // Chain enforcement
 
 	defaultPort := os.Getenv("PORT")
 	if defaultPort == "" {
@@ -51,7 +51,7 @@ func main() {
 	flag.Parse()
 
 	// Initialize LMDB backend
-	db := lmdb.LMDBBackend{Path: dbPath}
+	db := lmdb.LMDBBackend{Path: dbPath, MapSize: 1 << 30}
 	if err := db.Init(); err != nil {
 		fmt.Printf("failed to init lmdb: %v\n", err)
 		return
@@ -142,7 +142,7 @@ func main() {
 
 	// Start HTTP server
 	fmt.Printf("Chain-enforced relay running on :%s\n", port)
-	fmt.Println("Supported NIPs: 1, 9, 11, 42, 50, 70, 86")
+	fmt.Println("Supported NIPs: 1, 9, 11, 42, 70, 86, FF")
 	if err := http.ListenAndServe(":"+port, relay); err != nil {
 		fmt.Printf("server error: %v\n", err)
 	}

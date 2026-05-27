@@ -56,45 +56,49 @@ diverge test-chain
 exit
 COMMANDS
 
+# Strip ANSI escape codes for easier grepping
+CLEAN_LOG="$TMPDIR/session_clean.log"
+sed 's/\x1b\[[0-9;]*m//g' "$TMPDIR/session.log" > "$CLEAN_LOG"
+
 echo "Verifying outputs..."
 
 # Check genesis published to both relays
-if ! grep -q "to 2 relay" "$TMPDIR/session.log"; then
+if ! grep -q "to 2 relay" "$CLEAN_LOG"; then
 	echo "ERROR: Genesis should be published to 2 relays"
-	cat "$TMPDIR/session.log"
+	cat "$CLEAN_LOG"
 	exit 1
 fi
 
 # Check divergence detected
-if ! grep -q "DIVERGENCE" "$TMPDIR/session.log"; then
+if ! grep -q "DIVERGENCE" "$CLEAN_LOG"; then
 	echo "ERROR: Expected divergence not detected"
-	cat "$TMPDIR/session.log"
+	cat "$CLEAN_LOG"
 	exit 1
 fi
 
 # Check fix operations
-if ! grep -q "Deleting 1 event" "$TMPDIR/session.log"; then
+if ! grep -q "Deleting 1 event" "$CLEAN_LOG"; then
 	echo "ERROR: Fix should delete 1 event"
-	cat "$TMPDIR/session.log"
+	cat "$CLEAN_LOG"
 	exit 1
 fi
 
-if ! grep -q "Replaying 1 event" "$TMPDIR/session.log"; then
+if ! grep -q "Replaying 1 event" "$CLEAN_LOG"; then
 	echo "ERROR: Fix should replay 1 event"
-	cat "$TMPDIR/session.log"
+	cat "$CLEAN_LOG"
 	exit 1
 fi
 
-if ! grep -q "Replayed" "$TMPDIR/session.log"; then
+if ! grep -q "Replayed" "$CLEAN_LOG"; then
 	echo "ERROR: Fix should replay events successfully"
-	cat "$TMPDIR/session.log"
+	cat "$CLEAN_LOG"
 	exit 1
 fi
 
 # Check final sync
-if ! grep -q "are in sync" "$TMPDIR/session.log"; then
+if ! grep -q "are in sync" "$CLEAN_LOG"; then
 	echo "ERROR: Relays should be in sync after fix"
-	cat "$TMPDIR/session.log"
+	cat "$CLEAN_LOG"
 	exit 1
 fi
 

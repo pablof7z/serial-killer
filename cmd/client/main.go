@@ -11,6 +11,7 @@ import (
 
 	"github.com/chzyer/readline"
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip11"
 )
 
 // ANSI color codes
@@ -195,6 +196,23 @@ func (cs *ClientState) handleConnect(args []string) {
 	}
 	cs.relays[url] = true
 	fmt.Printf("%s %s\n", c(green, "Connected to"), url)
+
+	// Check NIP-11 for NIP-FF support
+	info, err := nip11.Fetch(cs.ctx, url)
+	if err != nil {
+		fmt.Printf("%s: could not fetch NIP-11: %v\n", c(yellow, "Warning"), err)
+		return
+	}
+	hasFF := false
+	for _, nip := range info.SupportedNIPs {
+		if nip == "FF" {
+			hasFF = true
+			break
+		}
+	}
+	if !hasFF {
+		fmt.Printf("%s: relay does not advertise NIP-FF support (chain enforcement may not work)\n", c(yellow, "Warning"))
+	}
 }
 
 func (cs *ClientState) handleDisconnect(args []string) {

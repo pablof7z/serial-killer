@@ -36,7 +36,7 @@ func main() {
 	flag.Parse()
 
 	// Initialize LMDB backend
-	db := lmdb.LMDBBackend{Path: dbPath}
+	db := lmdb.LMDBBackend{Path: dbPath, MapSize: 1 << 30}
 	if err := db.Init(); err != nil {
 		fmt.Printf("failed to init lmdb: %v\n", err)
 		return
