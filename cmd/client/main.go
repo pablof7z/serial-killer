@@ -243,14 +243,15 @@ func (cs *ClientState) handleGenesis(args []string) {
 	}
 	kind, chainName, content := parseCommandArgs(args)
 
+	tags := nostr.Tags{{"chain"}}
+	if chainName != "" {
+		tags = append(tags, nostr.Tag{"d", chainName})
+	}
 	evt := nostr.Event{
 		Kind:      kind,
 		CreatedAt: nostr.Now(),
-		Tags: nostr.Tags{
-			{"chain"},
-			{"d", chainName},
-		},
-		Content: content,
+		Tags:      tags,
+		Content:   content,
 	}
 	evt.PubKey = cs.secretKey.Public()
 	if err := evt.Sign(cs.secretKey); err != nil {
@@ -269,21 +270,22 @@ func (cs *ClientState) handleAppend(args []string) {
 	kind, chainName, content := parseCommandArgs(args)
 
 	// Find current head by querying all relays
-	head := cs.findHead(chainName)
+	head := cs.findHead(chainName, kind)
 	if head == "" {
 		fmt.Printf("%s\n", c(yellow, "No active head found. Use 'genesis' to start a chain."))
 		return
 	}
 
+	tags := nostr.Tags{{"chain"}}
+	if chainName != "" {
+		tags = append(tags, nostr.Tag{"d", chainName})
+	}
+	tags = append(tags, nostr.Tag{"prev", head})
 	evt := nostr.Event{
 		Kind:      kind,
 		CreatedAt: nostr.Now(),
-		Tags: nostr.Tags{
-			{"chain"},
-			{"d", chainName},
-			{"prev", head},
-		},
-		Content: content,
+		Tags:      tags,
+		Content:   content,
 	}
 	evt.PubKey = cs.secretKey.Public()
 	if err := evt.Sign(cs.secretKey); err != nil {
@@ -324,9 +326,9 @@ func (cs *ClientState) handleQuery(args []string) {
 		return
 	}
 	relayURL := normalizeURL(args[0])
-	chainName := args[1]
+	chainName, kind := parseChainArg(args[1])
 
-	chainEvents := cs.fetchChain([]string{relayURL}, chainName)
+	chainEvents := cs.fetchChain([]string{relayURL}, chainName, kind)
 	if len(chainEvents) == 0 {
 		fmt.Printf("%s\n", c(yellow, "No events found."))
 		return
@@ -339,7 +341,7 @@ func (cs *ClientState) handleQueryAll(args []string) {
 		fmt.Printf("%s: %s\n", c(red, "Usage"), "query-all <chain-name>")
 		return
 	}
-	chainName := args[0]
+	chainName, kind := parseChainArg(args[0])
 	if len(cs.relays) == 0 {
 		fmt.Printf("%s\n", c(yellow, "No relays connected."))
 		return
@@ -352,7 +354,7 @@ func (cs *ClientState) handleQueryAll(args []string) {
 
 	for _, url := range urls {
 		fmt.Printf("\n%s %s\n", c(bold+magenta, "=== Relay:"), c(bold+magenta, url))
-		chainEvents := cs.fetchChain([]string{url}, chainName)
+		chainEvents := cs.fetchChain([]string{url}, chainName, kind)
 		if len(chainEvents) == 0 {
 			fmt.Printf("%s\n", c(yellow, "No events found."))
 			continue
@@ -366,7 +368,7 @@ func (cs *ClientState) handleDiverge(args []string) {
 		fmt.Printf("%s: %s\n", c(red, "Usage"), "diverge <chain-name>")
 		return
 	}
-	chainName := args[0]
+	chainName, kind := parseChainArg(args[0])
 	if len(cs.relays) < 2 {
 		fmt.Printf("%s\n", c(yellow, "Need at least 2 relays to check divergence."))
 		return
@@ -380,11 +382,11 @@ func (cs *ClientState) handleDiverge(args []string) {
 	// Fetch chain from each relay
 	chains := make(map[string][]nostr.Event)
 	for _, url := range urls {
-		chains[url] = cs.fetchChain([]string{url}, chainName)
+		chains[url] = cs.fetchChain([]string{url}, chainName, kind)
 	}
 
 	// Find divergence
-	fmt.Printf("Checking divergence for chain '%s'...\n\n", c(cyan, chainName))
+	fmt.Printf("Checking divergence for chain '%s'...\n\n", c(cyan, chainLabel(chainName, kind)))
 	foundDivergence := false
 	for i := 0; i < len(urls); i++ {
 		for j := i + 1; j < len(urls); j++ {
@@ -416,12 +418,12 @@ func (cs *ClientState) handleFix(args []string) {
 		return
 	}
 	targetURL := normalizeURL(args[0])
-	chainName := args[1]
+	chainName, kind := parseChainArg(args[1])
 	canonicalURL := normalizeURL(args[2])
 
 	// Fetch from both
-	targetChain := cs.fetchChain([]string{targetURL}, chainName)
-	canonicalChain := cs.fetchChain([]string{canonicalURL}, chainName)
+	targetChain := cs.fetchChain([]string{targetURL}, chainName, kind)
+	canonicalChain := cs.fetchChain([]string{canonicalURL}, chainName, kind)
 
 	if len(canonicalChain) == 0 {
 		fmt.Printf("%s\n", c(yellow, "Canonical relay has no events for this chain."))
@@ -522,10 +524,14 @@ func (cs *ClientState) handleDelete(args []string) {
 }
 
 // Helper: fetch all events for a chain from given relays.
-func (cs *ClientState) fetchChain(urls []string, chainName string) []nostr.Event {
+func (cs *ClientState) fetchChain(urls []string, chainName string, kind nostr.Kind) []nostr.Event {
 	filter := nostr.Filter{
 		Authors: []nostr.PubKey{cs.secretKey.Public()},
-		Tags:    nostr.TagMap{"d": {chainName}},
+	}
+	if chainName != "" {
+		filter.Tags = nostr.TagMap{"d": {chainName}}
+	} else {
+		filter.Kinds = []nostr.Kind{kind}
 	}
 
 	ctx, cancel := context.WithTimeout(cs.ctx, 5*time.Second)
@@ -533,7 +539,18 @@ func (cs *ClientState) fetchChain(urls []string, chainName string) []nostr.Event
 
 	events := make(map[string]nostr.Event)
 	for ievt := range cs.pool.FetchMany(ctx, urls, filter, nostr.SubscriptionOptions{}) {
-		events[ievt.ID.Hex()] = ievt.Event
+		evt := ievt.Event
+		hasChainTag := false
+		for _, tag := range evt.Tags {
+			if len(tag) >= 1 && tag[0] == "chain" {
+				hasChainTag = true
+				break
+			}
+		}
+		if !hasChainTag {
+			continue
+		}
+		events[ievt.ID.Hex()] = evt
 	}
 
 	// Build chain by following prev pointers from head
@@ -596,7 +613,7 @@ func (cs *ClientState) fetchChain(urls []string, chainName string) []nostr.Event
 	return chain
 }
 
-func (cs *ClientState) findHead(chainName string) string {
+func (cs *ClientState) findHead(chainName string, kind nostr.Kind) string {
 	if len(cs.relays) == 0 {
 		return ""
 	}
@@ -604,7 +621,7 @@ func (cs *ClientState) findHead(chainName string) string {
 	for url := range cs.relays {
 		urls = append(urls, url)
 	}
-	chainEvents := cs.fetchChain(urls, chainName)
+	chainEvents := cs.fetchChain(urls, chainName, kind)
 	if len(chainEvents) == 0 {
 		return ""
 	}
@@ -792,10 +809,24 @@ func parseCommandArgs(args []string) (kind nostr.Kind, chainName string, content
 			rest = rest[1:]
 		}
 	}
-	// Implicit chain name: fall back to kind number string
-	if chainName == "" {
-		chainName = strconv.Itoa(int(kind))
-	}
 	content = strings.Join(rest, " ")
 	return
+}
+
+// parseChainArg converts a user-supplied chain identifier:
+// numeric → (empty chainName, kind N) — implicit chain identified by kind
+// string  → (chainName, 1)            — named chain identified by d tag
+func parseChainArg(arg string) (chainName string, kind nostr.Kind) {
+	if n, err := strconv.Atoi(arg); err == nil {
+		return "", nostr.Kind(n)
+	}
+	return arg, 1
+}
+
+// chainLabel returns a human-readable chain identifier for display.
+func chainLabel(chainName string, kind nostr.Kind) string {
+	if chainName != "" {
+		return chainName
+	}
+	return strconv.Itoa(int(kind))
 }
