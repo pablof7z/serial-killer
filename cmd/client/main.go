@@ -143,8 +143,8 @@ func printHelp() {
   %s <url>                Connect to a relay
   %s <url>             Disconnect from a relay
   %s                       List connected relays
-  %s <chain> [kind] <content>  Create a genesis event (default kind: 1)
-  %s <chain> [kind] <content>   Append to a chain (default kind: 1)
+  %s [chain=NAME] [kind=N] <content>  Create a genesis event
+  %s [chain=NAME] [kind=N] <content>   Append to a chain
   %s <relay> <chain>       Query a chain from a relay
   %s <chain>             Query a chain from all relays
   %s <chain>              Check for divergence across relays
@@ -197,7 +197,7 @@ func (cs *ClientState) handleConnect(args []string) {
 	cs.relays[url] = true
 	fmt.Printf("%s %s\n", c(green, "Connected to"), url)
 
-	// Check NIP-11 for NIP-FF support
+	// Check NIP-11 for NIP-EC support
 	info, err := nip11.Fetch(cs.ctx, url)
 	if err != nil {
 		fmt.Printf("%s: could not fetch NIP-11: %v\n", c(yellow, "Warning"), err)
@@ -211,7 +211,7 @@ func (cs *ClientState) handleConnect(args []string) {
 		}
 	}
 	if !hasFF {
-		fmt.Printf("%s: relay does not advertise NIP-FF support (chain enforcement may not work)\n", c(yellow, "Warning"))
+		fmt.Printf("%s: relay does not advertise NIP-EC support (chain enforcement may not work)\n", c(yellow, "Warning"))
 	}
 }
 
@@ -237,19 +237,18 @@ func (cs *ClientState) handleRelays() {
 }
 
 func (cs *ClientState) handleGenesis(args []string) {
-	if len(args) < 2 {
-		fmt.Printf("%s: %s\n", c(red, "Usage"), "genesis <chain-name> [kind] <content>")
+	if len(args) < 1 {
+		fmt.Printf("%s: %s\n", c(red, "Usage"), "genesis [chain=NAME] [kind=N] <content>")
 		return
 	}
-	chainName := args[0]
-	kind, content := parseKindAndContent(args[1:])
+	kind, chainName, content := parseCommandArgs(args)
 
 	evt := nostr.Event{
 		Kind:      kind,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
 			{"chain"},
-			{"C", chainName},
+			{"d", chainName},
 		},
 		Content: content,
 	}
@@ -263,12 +262,11 @@ func (cs *ClientState) handleGenesis(args []string) {
 }
 
 func (cs *ClientState) handleAppend(args []string) {
-	if len(args) < 2 {
-		fmt.Printf("%s: %s\n", c(red, "Usage"), "append <chain-name> [kind] <content>")
+	if len(args) < 1 {
+		fmt.Printf("%s: %s\n", c(red, "Usage"), "append [chain=NAME] [kind=N] <content>")
 		return
 	}
-	chainName := args[0]
-	kind, content := parseKindAndContent(args[1:])
+	kind, chainName, content := parseCommandArgs(args)
 
 	// Find current head by querying all relays
 	head := cs.findHead(chainName)
@@ -282,7 +280,7 @@ func (cs *ClientState) handleAppend(args []string) {
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
 			{"chain"},
-			{"C", chainName},
+			{"d", chainName},
 			{"prev", head},
 		},
 		Content: content,
@@ -527,7 +525,7 @@ func (cs *ClientState) handleDelete(args []string) {
 func (cs *ClientState) fetchChain(urls []string, chainName string) []nostr.Event {
 	filter := nostr.Filter{
 		Authors: []nostr.PubKey{cs.secretKey.Public()},
-		Tags:    nostr.TagMap{"C": {chainName}},
+		Tags:    nostr.TagMap{"d": {chainName}},
 	}
 
 	ctx, cancel := context.WithTimeout(cs.ctx, 5*time.Second)
@@ -613,8 +611,10 @@ func (cs *ClientState) findHead(chainName string) string {
 	return chainEvents[len(chainEvents)-1].ID.Hex()
 }
 
+// deleteEvents deletes events tip-first (reverse order) and stops on first error.
 func (cs *ClientState) deleteEvents(relayURL string, events []nostr.Event) {
-	for _, evt := range events {
+	for i := len(events) - 1; i >= 0; i-- {
+		evt := events[i]
 		delEvt := nostr.Event{
 			Kind:      5,
 			CreatedAt: nostr.Now(),
@@ -627,18 +627,23 @@ func (cs *ClientState) deleteEvents(relayURL string, events []nostr.Event) {
 		delEvt.PubKey = cs.secretKey.Public()
 		if err := delEvt.Sign(cs.secretKey); err != nil {
 			fmt.Printf("  %s %s: %v\n", c(red, "Failed to sign deletion for"), evt.ID.Hex(), err)
-			continue
+			return
 		}
 
+		failed := false
 		ctx, cancel := context.WithTimeout(cs.ctx, 5*time.Second)
 		for res := range cs.pool.PublishMany(ctx, []string{relayURL}, delEvt) {
 			if res.Error != nil {
-				fmt.Printf("  [%s] %s %s: %v\n", res.RelayURL, c(red, "Delete"), evt.ID.Hex(), res.Error)
+				fmt.Printf("  [%s] %s %s: %v\n", res.RelayURL, c(red, "Delete failed"), evt.ID.Hex(), res.Error)
+				failed = true
 			} else {
 				fmt.Printf("  [%s] %s %s\n", res.RelayURL, c(green, "Deleted"), evt.ID.Hex())
 			}
 		}
 		cancel()
+		if failed {
+			return
+		}
 	}
 }
 
@@ -745,16 +750,52 @@ func normalizeURL(url string) string {
 	return nostr.NormalizeURL(url)
 }
 
-// parseKindAndContent parses the remaining args after chain name.
-// If the first arg is a valid integer, it's treated as the kind.
-// Otherwise defaults to kind 1.
-func parseKindAndContent(args []string) (nostr.Kind, string) {
-	if len(args) == 0 {
-		return 1, ""
+// parseCommandArgs parses genesis/append arguments, supporting both styles:
+//   named:      [kind=N] [chain=NAME] <content>
+//   positional: <chain-name> [kind] <content>  (backwards compat)
+//
+// If chain is not specified, it defaults to the kind number as a string,
+// which matches the implicit chain name for replaceable events.
+func parseCommandArgs(args []string) (kind nostr.Kind, chainName string, content string) {
+	kind = 1
+	var rest []string
+	for _, arg := range args {
+		k, v, ok := strings.Cut(arg, "=")
+		if !ok {
+			rest = append(rest, arg)
+			continue
+		}
+		switch k {
+		case "kind":
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 && n != 5 {
+				kind = nostr.Kind(n)
+			} else {
+				rest = append(rest, arg)
+			}
+		case "chain":
+			chainName = v
+		default:
+			rest = append(rest, arg)
+		}
 	}
-	kind, err := strconv.Atoi(args[0])
-	if err == nil && kind >= 0 && kind != 5 {
-		return nostr.Kind(kind), strings.Join(args[1:], " ")
+	// Positional chain name: first non-numeric remaining arg when chain not set
+	if chainName == "" && len(rest) > 0 {
+		if _, err := strconv.Atoi(rest[0]); err != nil {
+			chainName = rest[0]
+			rest = rest[1:]
+		}
 	}
-	return 1, strings.Join(args, " ")
+	// Positional kind: first numeric remaining arg when kind not set via key=value
+	if len(rest) > 0 {
+		if n, err := strconv.Atoi(rest[0]); err == nil && n >= 0 && n != 5 {
+			kind = nostr.Kind(n)
+			rest = rest[1:]
+		}
+	}
+	// Implicit chain name: fall back to kind number string
+	if chainName == "" {
+		chainName = strconv.Itoa(int(kind))
+	}
+	content = strings.Join(rest, " ")
+	return
 }

@@ -1,6 +1,6 @@
 # serial-killer
 
-A Nostr relay implementing **NIP-FF** — relay-enforced linear event chains.
+A Nostr relay implementing **NIP-EC** — relay-enforced linear event chains.
 
 ## What problem does this solve?
 

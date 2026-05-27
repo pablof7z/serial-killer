@@ -91,23 +91,33 @@ func main() {
 		}
 	}
 
-	// Wrap StoreEvent: for chain events, atomically validate and update head
+	// Wrap StoreEvent: for chain events validate; for non-chain events check opt-out
 	relay.StoreEvent = func(ctx context.Context, evt nostr.Event) error {
 		if chain.IsChainEvent(evt) {
 			_, accepted, reason := chainState.AcceptIfValid(evt)
 			if !accepted {
 				return fmt.Errorf("%s", reason)
 			}
+		} else {
+			_, errMsg := chainState.AcceptOptOut(evt)
+			if errMsg != "" {
+				return fmt.Errorf("%s", errMsg)
+			}
 		}
 		return originalStoreEvent(ctx, evt)
 	}
 
-	// Wrap ReplaceEvent: for chain events, atomically validate and update head
+	// Wrap ReplaceEvent: for chain events validate; for non-chain events check opt-out
 	relay.ReplaceEvent = func(ctx context.Context, evt nostr.Event) error {
 		if chain.IsChainEvent(evt) {
 			_, accepted, reason := chainState.AcceptIfValid(evt)
 			if !accepted {
 				return fmt.Errorf("%s", reason)
+			}
+		} else {
+			_, errMsg := chainState.AcceptOptOut(evt)
+			if errMsg != "" {
+				return fmt.Errorf("%s", errMsg)
 			}
 		}
 		return originalReplaceEvent(ctx, evt)
@@ -115,7 +125,6 @@ func main() {
 
 	// Wrap DeleteEvent: for chain events, don't delete from storage, just update state
 	relay.DeleteEvent = func(ctx context.Context, id nostr.ID) error {
-		// We need to check if this is a chain event. Query for it.
 		var target *nostr.Event
 		for evt := range originalQueryStored(ctx, nostr.Filter{IDs: []nostr.ID{id}}) {
 			target = &evt
@@ -123,18 +132,48 @@ func main() {
 		}
 		if target != nil && chain.IsChainEvent(*target) {
 			chainID, _ := chain.GetChainID(*target)
-			// Mark as tombstoned and rewind head
-			_ = chainState.HandleDeletion(chainID, id.Hex())
-			// Return success but don't remove from storage
+			if err := chainState.HandleDeletion(chainID, id.Hex()); err != nil {
+				return err
+			}
 			return nil
 		}
 		return originalDeleteEvent(ctx, id)
 	}
 
-	// OnEvent: basic validation for non-chain events
+	// chainDeletionValidator rejects kind-5 events targeting non-head chain events.
+	// This runs in OnEvent before storage, guaranteeing the negative OK is delivered.
+	chainDeletionValidator := func(ctx context.Context, evt nostr.Event) (bool, string) {
+		if evt.Kind != 5 {
+			return false, ""
+		}
+		for _, tag := range evt.Tags {
+			if len(tag) < 2 || tag[0] != "e" {
+				continue
+			}
+			id, err := nostr.IDFromHex(tag[1])
+			if err != nil {
+				continue
+			}
+			var target *nostr.Event
+			for e := range originalQueryStored(ctx, nostr.Filter{IDs: []nostr.ID{id}}) {
+				target = &e
+				break
+			}
+			if target != nil && chain.IsChainEvent(*target) {
+				chainID, _ := chain.GetChainID(*target)
+				if !chainState.IsHead(chainID, tag[1]) {
+					return true, "invalid: chain:not-head"
+				}
+			}
+		}
+		return false, ""
+	}
+
+	// OnEvent: validate kinds, size, and chain deletion targets
 	relay.OnEvent = policies.SeqEvent(
 		policies.ValidateKind,
 		policies.PreventLargeContent(100000),
+		chainDeletionValidator,
 	)
 
 	// OnEventSaved: no-op for chain events (head already updated atomically in StoreEvent)
