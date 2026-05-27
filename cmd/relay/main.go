@@ -7,10 +7,11 @@ import (
 	"iter"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 
 	"fiatjaf.com/nostr"
-	"fiatjaf.com/nostr/eventstore/lmdb"
+	"fiatjaf.com/nostr/eventstore/boltdb"
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/khatru/policies"
 
@@ -32,28 +33,29 @@ func main() {
 		defaultPort = "3334"
 	}
 
-	defaultDbPath := os.Getenv("DB_PATH")
-	if defaultDbPath == "" {
-		defaultDbPath = "./db"
-	}
-
-	defaultStatePath := os.Getenv("STATE_PATH")
-	if defaultStatePath == "" {
-		defaultStatePath = "./chain-state.json"
+	defaultDataPath := os.Getenv("DATA_PATH")
+	if defaultDataPath == "" {
+		defaultDataPath = "./data"
 	}
 
 	var port string
-	var dbPath string
-	var statePath string
+	var dataPath string
 	flag.StringVar(&port, "port", defaultPort, "Port to run the relay on")
-	flag.StringVar(&dbPath, "db-path", defaultDbPath, "Path to the LMDB database directory")
-	flag.StringVar(&statePath, "state-path", defaultStatePath, "Path to the chain state JSON file")
+	flag.StringVar(&dataPath, "data", defaultDataPath, "Data directory for the relay (BoltDB + chain state)")
 	flag.Parse()
 
-	// Initialize LMDB backend
-	db := lmdb.LMDBBackend{Path: dbPath, MapSize: 1 << 30}
+	if err := os.MkdirAll(dataPath, 0755); err != nil {
+		fmt.Printf("failed to create data directory: %v\n", err)
+		return
+	}
+
+	dbPath := filepath.Join(dataPath, "relay.db")
+	statePath := filepath.Join(dataPath, "chain-state.json")
+
+	// Initialize BoltDB backend
+	db := boltdb.BoltBackend{Path: dbPath}
 	if err := db.Init(); err != nil {
-		fmt.Printf("failed to init lmdb: %v\n", err)
+		fmt.Printf("failed to init boltdb: %v\n", err)
 		return
 	}
 	defer db.Close()

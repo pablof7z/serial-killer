@@ -29,12 +29,12 @@ echo "Test key: $TEST_KEY"
 
 # Start relay1
 echo "Starting relay1 on port 3335..."
-PORT=3335 DB_PATH="$TMPDIR/db1" STATE_PATH="$TMPDIR/chain1.json" ./relay > "$TMPDIR/relay1.log" 2>&1 &
+PORT=3335 DATA_PATH="$TMPDIR/data1" ./relay > "$TMPDIR/relay1.log" 2>&1 &
 sleep 1
 
 # Start relay2
 echo "Starting relay2 on port 3336..."
-PORT=3336 DB_PATH="$TMPDIR/db2" STATE_PATH="$TMPDIR/chain2.json" ./relay > "$TMPDIR/relay2.log" 2>&1 &
+PORT=3336 DATA_PATH="$TMPDIR/data2" ./relay > "$TMPDIR/relay2.log" 2>&1 &
 sleep 1
 
 # Run a single client session to demonstrate divergence and fix

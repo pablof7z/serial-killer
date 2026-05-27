@@ -25,15 +25,15 @@ run-relay:
 run-client:
     go run ./cmd/client
 
-# Run two relays on separate ports with separate databases
+# Run two relays on separate ports with separate data directories
 run-relays: build-relay
     echo "Starting relay A on port 3334..."
-    ./relay -port 3334 -db-path ./relay-a.db -state-path ./chain-state1.json & echo $! > .relay-a.pid
+    ./relay -port 3334 -data ./relay-a & echo $! > .relay-a.pid
     echo "Starting relay B on port 3335..."
-    ./relay -port 3335 -db-path ./relay-b.db -state-path ./chain-state2.json & echo $! > .relay-b.pid
+    ./relay -port 3335 -data ./relay-b & echo $! > .relay-b.pid
     echo "Relays running:"
-    echo "  A: ws://localhost:3334 (db: ./relay-a.db, state: ./chain-state1.json)"
-    echo "  B: ws://localhost:3335 (db: ./relay-b.db, state: ./chain-state2.json)"
+    echo "  A: ws://localhost:3334 (data: ./relay-a)"
+    echo "  B: ws://localhost:3335 (data: ./relay-b)"
     echo "Run 'just stop-relays' to shut them down."
 
 # Stop the running relays
@@ -42,14 +42,14 @@ stop-relays:
     -test -f .relay-b.pid && kill $(cat .relay-b.pid) 2>/dev/null && rm -f .relay-b.pid
     echo "Relays stopped."
 
-# Clean relay data files
+# Clean relay data directories
 clean-relays: stop-relays
-    rm -f relay-a.db relay-b.db chain-state1.json chain-state2.json
+    rm -rf relay-a relay-b
 
 # Clean build artifacts
 clean:
     rm -f client relay .relay-a.pid .relay-b.pid
-    rm -f relay-a.db relay-b.db chain-state1.json chain-state2.json
+    rm -rf relay-a relay-b
 
 # Tidy Go dependencies
 tidy:
