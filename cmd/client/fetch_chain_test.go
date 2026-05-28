@@ -189,3 +189,18 @@ func TestFindHeadNamedChain(t *testing.T) {
 		t.Fatalf("expected head %s, got %s", genesis.ID.Hex(), head)
 	}
 }
+
+func TestHandleDeleteInvalidEventIDDoesNotPanic(t *testing.T) {
+	url, cleanup := setupSimpleRelay(t)
+	defer cleanup()
+	cs, csCleanup := newTestClient(t, url)
+	defer csCleanup()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("handleDelete should not panic on invalid event id: %v", r)
+		}
+	}()
+
+	cs.handleDelete([]string{url, "test-chain", "not-a-hex-id"})
+}

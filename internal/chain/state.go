@@ -2,8 +2,10 @@ package chain
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
@@ -175,46 +177,86 @@ func (s *State) AcceptIfValid(evt nostr.Event) (chainID ChainID, accepted bool, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.acceptChainIfValid(chainID, prev, evt.ID.Hex())
+	if ok, msg := s.acceptChainIfValid(chainID, prev, evt.ID.Hex()); !ok {
+		return ChainID{}, false, msg
+	}
+	if err := s.recordChainAccepted(chainID, prev, evt.ID.Hex()); err != nil {
+		return ChainID{}, false, err.Error()
+	}
+	return chainID, true, ""
 }
 
-// acceptChainIfValid implements the chain acceptance rule:
+// StoreChainEvent atomically validates, stores, and records a chain event.
+func (s *State) StoreChainEvent(evt nostr.Event, store func(nostr.Event) error) error {
+	chainID, prev, reject, msg := ValidateChainEvent(evt)
+	if reject {
+		return errors.New(msg)
+	}
+	if chainID.PubKey == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ok, msg := s.acceptChainIfValid(chainID, prev, evt.ID.Hex()); !ok {
+		return errors.New(msg)
+	}
+	if store != nil {
+		if err := store(evt); err != nil {
+			return err
+		}
+	}
+	return s.recordChainAccepted(chainID, prev, evt.ID.Hex())
+}
+
+// acceptChainIfValid checks the chain acceptance rule:
 // the incoming prev must match the current active head.
 // Caller must hold s.mu.Lock().
-func (s *State) acceptChainIfValid(chainID ChainID, prev, evtID string) (ChainID, bool, string) {
+func (s *State) acceptChainIfValid(chainID ChainID, prev, evtID string) (bool, string) {
 	cs := s.chains[chainID.String()]
 
 	if cs != nil {
 		if existing, ok := cs.Events[evtID]; ok {
 			if existing.Tombstoned {
-				return ChainID{}, false, fmt.Sprintf("invalid: chain:tombstoned %s", evtID)
+				return false, fmt.Sprintf("invalid: chain:tombstoned %s", evtID)
 			}
-			return chainID, true, ""
+			return true, ""
 		}
 	}
 
-	if cs == nil {
+	if cs == nil || cs.Head == "" {
 		if prev != "" {
-			return ChainID{}, false, fmt.Sprintf("invalid: chain:missing-prev %s", prev)
+			return false, fmt.Sprintf("invalid: chain:missing-prev %s", prev)
 		}
+		return true, ""
+	}
+
+	if prev == "" {
+		return false, fmt.Sprintf("invalid: chain:stale-prev current=%s", cs.Head)
+	}
+	if prev != cs.Head {
+		return false, fmt.Sprintf("invalid: chain:stale-prev current=%s", cs.Head)
+	}
+	if h, ok := cs.Events[prev]; !ok || h.Tombstoned {
+		return false, fmt.Sprintf("invalid: chain:missing-prev %s", prev)
+	}
+
+	return true, ""
+}
+
+// recordChainAccepted records an already accepted chain event.
+// Caller must hold s.mu.Lock().
+func (s *State) recordChainAccepted(chainID ChainID, prev, evtID string) error {
+	cs := s.chains[chainID.String()]
+	if cs == nil {
 		cs = &ChainState{Events: make(map[string]*ChainEvent)}
 		s.chains[chainID.String()] = cs
-	} else {
-		if prev == "" {
-			return ChainID{}, false, fmt.Sprintf("invalid: chain:stale-prev current=%s", cs.Head)
-		}
-		if prev != cs.Head {
-			return ChainID{}, false, fmt.Sprintf("invalid: chain:stale-prev current=%s", cs.Head)
-		}
-		if h, ok := cs.Events[prev]; !ok || h.Tombstoned {
-			return ChainID{}, false, fmt.Sprintf("invalid: chain:missing-prev %s", prev)
-		}
 	}
 
 	cs.Events[evtID] = &ChainEvent{Prev: prev}
 	cs.Head = evtID
-	_ = s.save()
-	return chainID, true, ""
+	return s.save()
 }
 
 // AcceptOptOut handles opt-out events: events that have prev but no ["chain"].
@@ -225,10 +267,23 @@ func (s *State) acceptChainIfValid(chainID ChainID, prev, evtID string) (ChainID
 //   - If active chain and prev doesn't match: returns dissolved=false, err="invalid: chain:stale-prev current=<head>"
 //   - If active chain and no prev: returns dissolved=false, err="invalid: chain:missing-prev <head>"
 func (s *State) AcceptOptOut(evt nostr.Event) (dissolved bool, err string) {
+	dissolved, storeErr := s.StoreOptOutEvent(evt, nil)
+	if storeErr != nil {
+		return false, storeErr.Error()
+	}
+	return dissolved, ""
+}
+
+// StoreOptOutEvent atomically validates, stores, and applies a non-chain event
+// that may dissolve an active chain.
+func (s *State) StoreOptOutEvent(evt nostr.Event, store func(nostr.Event) error) (dissolved bool, err error) {
 	chainID, ok := getChainIDForOptOut(evt)
 	if !ok {
 		// Has ["chain"] tag — not an opt-out event
-		return false, ""
+		if store != nil {
+			return false, store(evt)
+		}
+		return false, nil
 	}
 
 	// Extract prev tag
@@ -244,23 +299,30 @@ func (s *State) AcceptOptOut(evt nostr.Event) (dissolved bool, err string) {
 	defer s.mu.Unlock()
 
 	cs := s.chains[chainID.String()]
-	if cs == nil {
+	if cs == nil || cs.Head == "" {
 		// No active chain for this key — nothing to do
-		return false, ""
+		if store != nil {
+			return false, store(evt)
+		}
+		return false, nil
 	}
 
 	head := cs.Head
 	if prevVal == "" {
-		return false, fmt.Sprintf("invalid: chain:missing-prev %s", head)
+		return false, fmt.Errorf("invalid: chain:missing-prev %s", head)
 	}
 	if prevVal != head {
-		return false, fmt.Sprintf("invalid: chain:stale-prev current=%s", head)
+		return false, fmt.Errorf("invalid: chain:stale-prev current=%s", head)
+	}
+	if store != nil {
+		if err := store(evt); err != nil {
+			return false, err
+		}
 	}
 
 	// prev matches head — dissolve the chain
 	delete(s.chains, chainID.String())
-	_ = s.save()
-	return true, ""
+	return true, s.save()
 }
 
 // IsHead returns true if eventID is the current active head of the chain.
@@ -277,6 +339,14 @@ func (s *State) HandleDeletion(chainID ChainID, eventID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.handleDeletionLocked(chainID, eventID); err != nil {
+		return err
+	}
+	return s.save()
+}
+
+// Caller must hold s.mu.Lock().
+func (s *State) handleDeletionLocked(chainID ChainID, eventID string) error {
 	cs, exists := s.chains[chainID.String()]
 	if !exists || cs.Head != eventID {
 		return fmt.Errorf("invalid: chain:not-head")
@@ -290,7 +360,7 @@ func (s *State) HandleDeletion(chainID ChainID, eventID string) error {
 	ev.Tombstoned = true
 	cs.Head = ev.Prev
 
-	return s.save()
+	return nil
 }
 
 // IsChainEventDeleted checks if a specific event is tombstoned.
@@ -334,32 +404,94 @@ func (s *State) GetChainState(chainID ChainID) (*ChainState, bool) {
 	return copyCS, true
 }
 
-// RebuildFromEvents rebuilds chain state from a slice of events (sorted by created_at asc).
+// RebuildFromEvents rebuilds chain state from a slice of events.
 func (s *State) RebuildFromEvents(events []nostr.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.chains = make(map[string]*ChainState)
+
+	slices.SortFunc(events, func(a, b nostr.Event) int {
+		if a.CreatedAt < b.CreatedAt {
+			return -1
+		}
+		if a.CreatedAt > b.CreatedAt {
+			return 1
+		}
+		return strings.Compare(a.ID.Hex(), b.ID.Hex())
+	})
+
+	eventsByID := make(map[string]nostr.Event, len(events))
 	for _, evt := range events {
+		eventsByID[evt.ID.Hex()] = evt
+	}
+
+	for _, evt := range events {
+		if evt.Kind == 5 {
+			s.rebuildDeletion(evt, eventsByID)
+			continue
+		}
+
 		chainID, prev, reject, _ := ValidateChainEvent(evt)
-		if reject || chainID.PubKey == "" {
+		if reject {
 			continue
 		}
-
-		cs, exists := s.chains[chainID.String()]
-		if !exists {
-			cs = &ChainState{Events: make(map[string]*ChainEvent)}
-			s.chains[chainID.String()] = cs
-		}
-
-		if existing, ok := cs.Events[evt.ID.Hex()]; ok && existing.Tombstoned {
+		if chainID.PubKey == "" {
+			s.rebuildOptOut(evt)
 			continue
 		}
-
-		cs.Events[evt.ID.Hex()] = &ChainEvent{Prev: prev}
-		cs.Head = evt.ID.Hex()
+		if ok, _ := s.acceptChainIfValid(chainID, prev, evt.ID.Hex()); !ok {
+			continue
+		}
+		_ = s.recordChainAcceptedNoSave(chainID, prev, evt.ID.Hex())
 	}
 
 	_ = s.save()
+}
+
+func (s *State) rebuildOptOut(evt nostr.Event) {
+	chainID, ok := getChainIDForOptOut(evt)
+	if !ok {
+		return
+	}
+	prevVal := ""
+	for _, tag := range evt.Tags {
+		if len(tag) >= 2 && tag[0] == "prev" {
+			prevVal = tag[1]
+			break
+		}
+	}
+	cs := s.chains[chainID.String()]
+	if cs == nil || prevVal == "" || prevVal != cs.Head {
+		return
+	}
+	delete(s.chains, chainID.String())
+}
+
+func (s *State) rebuildDeletion(evt nostr.Event, eventsByID map[string]nostr.Event) {
+	for _, tag := range evt.Tags {
+		if len(tag) < 2 || tag[0] != "e" {
+			continue
+		}
+		target, ok := eventsByID[tag[1]]
+		if !ok || target.PubKey != evt.PubKey || !IsChainEvent(target) {
+			continue
+		}
+		chainID, _ := GetChainID(target)
+		_ = s.handleDeletionLocked(chainID, tag[1])
+	}
+}
+
+// Caller must hold s.mu.Lock().
+func (s *State) recordChainAcceptedNoSave(chainID ChainID, prev, evtID string) error {
+	cs := s.chains[chainID.String()]
+	if cs == nil {
+		cs = &ChainState{Events: make(map[string]*ChainEvent)}
+		s.chains[chainID.String()] = cs
+	}
+	cs.Events[evtID] = &ChainEvent{Prev: prev}
+	cs.Head = evtID
+	return nil
 }
 
 // DeleteChain removes all chain state for the given chain, lifting protection.

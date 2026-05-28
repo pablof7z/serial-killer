@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chzyer/readline"
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
+	"github.com/chzyer/readline"
 )
 
 // ANSI color codes
@@ -478,10 +478,15 @@ func (cs *ClientState) handleDelete(args []string) {
 	relayURL := normalizeURL(args[0])
 	_ = args[1] // chainName not needed for the actual delete event
 	eventID := args[2]
+	id, err := nostr.IDFromHex(eventID)
+	if err != nil {
+		fmt.Printf("%s: %v\n", c(red, "Invalid event ID"), err)
+		return
+	}
 
 	// Fetch the target event to get its kind
 	filter := nostr.Filter{
-		IDs: []nostr.ID{nostr.MustIDFromHex(eventID)},
+		IDs: []nostr.ID{id},
 	}
 	ctx, cancel := context.WithTimeout(cs.ctx, 5*time.Second)
 	var target *nostr.Event
@@ -768,8 +773,9 @@ func normalizeURL(url string) string {
 }
 
 // parseCommandArgs parses genesis/append arguments, supporting both styles:
-//   named:      [kind=N] [chain=NAME] <content>
-//   positional: <chain-name> [kind] <content>  (backwards compat)
+//
+//	named:      [kind=N] [chain=NAME] <content>
+//	positional: <chain-name> [kind] <content>  (backwards compat)
 //
 // If chain is not specified, it defaults to the kind number as a string,
 // which matches the implicit chain name for replaceable events.

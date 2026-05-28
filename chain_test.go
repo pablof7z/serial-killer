@@ -67,33 +67,27 @@ func setupTestRelay(t *testing.T) (string, *chain.State, func()) {
 	// Wrap StoreEvent: for chain events validate; for non-chain events check opt-out
 	relay.StoreEvent = func(ctx context.Context, evt nostr.Event) error {
 		if chain.IsChainEvent(evt) {
-			_, accepted, reason := chainState.AcceptIfValid(evt)
-			if !accepted {
-				return fmt.Errorf("%s", reason)
-			}
-		} else {
-			_, errMsg := chainState.AcceptOptOut(evt)
-			if errMsg != "" {
-				return fmt.Errorf("%s", errMsg)
-			}
+			return chainState.StoreChainEvent(evt, func(evt nostr.Event) error {
+				return originalStoreEvent(ctx, evt)
+			})
 		}
-		return originalStoreEvent(ctx, evt)
+		_, err := chainState.StoreOptOutEvent(evt, func(evt nostr.Event) error {
+			return originalStoreEvent(ctx, evt)
+		})
+		return err
 	}
 
 	// Wrap ReplaceEvent: for chain events validate; for non-chain events check opt-out
 	relay.ReplaceEvent = func(ctx context.Context, evt nostr.Event) error {
 		if chain.IsChainEvent(evt) {
-			_, accepted, reason := chainState.AcceptIfValid(evt)
-			if !accepted {
-				return fmt.Errorf("%s", reason)
-			}
-		} else {
-			_, errMsg := chainState.AcceptOptOut(evt)
-			if errMsg != "" {
-				return fmt.Errorf("%s", errMsg)
-			}
+			return chainState.StoreChainEvent(evt, func(evt nostr.Event) error {
+				return originalStoreEvent(ctx, evt)
+			})
 		}
-		return originalReplaceEvent(ctx, evt)
+		_, err := chainState.StoreOptOutEvent(evt, func(evt nostr.Event) error {
+			return originalReplaceEvent(ctx, evt)
+		})
+		return err
 	}
 
 	// Wrap DeleteEvent: for chain events, don't delete from storage, just update state
@@ -850,6 +844,255 @@ func TestTombstonedEventCannotBeReactivated(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "tombstoned") {
 		t.Fatalf("expected tombstoned error, got: %v", err)
+	}
+}
+
+func TestDeleteGenesisAllowsFreshGenesis(t *testing.T) {
+	url, _, cleanup := setupTestRelay(t)
+	defer cleanup()
+
+	sk := nostr.Generate()
+	pool := nostr.NewPool()
+	defer pool.Close("test done")
+
+	genesis := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"chain"}, {"d", "reset-chain"}},
+		Content:   "genesis",
+	}
+	genesis.PubKey = sk.Public()
+	if err := genesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign genesis: %v", err)
+	}
+	if err := publishEvent(t, pool, []string{url}, genesis); err != nil {
+		t.Fatalf("failed to publish genesis: %v", err)
+	}
+
+	delGenesis := nostr.Event{
+		Kind:      5,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"e", genesis.ID.Hex()},
+			{"k", fmt.Sprintf("%d", genesis.Kind)},
+		},
+		Content: "delete genesis",
+	}
+	delGenesis.PubKey = sk.Public()
+	if err := delGenesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign deletion: %v", err)
+	}
+	if err := publishEvent(t, pool, []string{url}, delGenesis); err != nil {
+		t.Fatalf("failed to delete genesis: %v", err)
+	}
+
+	plain := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now() + 1,
+		Tags:      nostr.Tags{{"d", "reset-chain"}},
+		Content:   "plain after delete",
+	}
+	plain.PubKey = sk.Public()
+	if err := plain.Sign(sk); err != nil {
+		t.Fatalf("failed to sign plain event: %v", err)
+	}
+	if err := publishEvent(t, pool, []string{url}, plain); err != nil {
+		t.Fatalf("plain event should be accepted after deleting genesis: %v", err)
+	}
+
+	freshGenesis := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now() + 2,
+		Tags:      nostr.Tags{{"chain"}, {"d", "reset-chain"}},
+		Content:   "fresh genesis",
+	}
+	freshGenesis.PubKey = sk.Public()
+	if err := freshGenesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign fresh genesis: %v", err)
+	}
+	if err := publishEvent(t, pool, []string{url}, freshGenesis); err != nil {
+		t.Fatalf("fresh genesis should be accepted after deleting genesis: %v", err)
+	}
+}
+
+func TestReplaceableChainKeepsHistory(t *testing.T) {
+	url, _, cleanup := setupTestRelay(t)
+	defer cleanup()
+
+	sk := nostr.Generate()
+	pool := nostr.NewPool()
+	defer pool.Close("test done")
+
+	genesis := nostr.Event{
+		Kind:      3,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"chain"}, {"d", "contacts"}},
+		Content:   "contacts-v1",
+	}
+	genesis.PubKey = sk.Public()
+	if err := genesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign genesis: %v", err)
+	}
+	if err := publishEvent(t, pool, []string{url}, genesis); err != nil {
+		t.Fatalf("failed to publish genesis: %v", err)
+	}
+
+	appendEvt := nostr.Event{
+		Kind:      3,
+		CreatedAt: nostr.Now() + 1,
+		Tags:      nostr.Tags{{"chain"}, {"d", "contacts"}, {"prev", genesis.ID.Hex()}},
+		Content:   "contacts-v2",
+	}
+	appendEvt.PubKey = sk.Public()
+	if err := appendEvt.Sign(sk); err != nil {
+		t.Fatalf("failed to sign append: %v", err)
+	}
+	if err := publishEvent(t, pool, []string{url}, appendEvt); err != nil {
+		t.Fatalf("failed to publish append: %v", err)
+	}
+
+	events := queryChainEvents(t, pool, []string{url}, sk.Public(), "contacts")
+	if len(events) != 2 {
+		t.Fatalf("replaceable chain should retain both history events, got %d", len(events))
+	}
+}
+
+func TestRebuildHonorsOptOutEvents(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "chain-state-*.json")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	sk := nostr.Generate()
+	genesis := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"chain"}, {"d", "opt-chain"}},
+		Content:   "genesis",
+	}
+	genesis.PubKey = sk.Public()
+	if err := genesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign genesis: %v", err)
+	}
+
+	appendEvt := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now() + 1,
+		Tags:      nostr.Tags{{"chain"}, {"d", "opt-chain"}, {"prev", genesis.ID.Hex()}},
+		Content:   "append",
+	}
+	appendEvt.PubKey = sk.Public()
+	if err := appendEvt.Sign(sk); err != nil {
+		t.Fatalf("failed to sign append: %v", err)
+	}
+
+	optOut := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now() + 2,
+		Tags:      nostr.Tags{{"d", "opt-chain"}, {"prev", appendEvt.ID.Hex()}},
+		Content:   "opt out",
+	}
+	optOut.PubKey = sk.Public()
+	if err := optOut.Sign(sk); err != nil {
+		t.Fatalf("failed to sign opt-out: %v", err)
+	}
+
+	chainID, ok := chain.GetChainID(genesis)
+	if !ok {
+		t.Fatal("expected genesis chain id")
+	}
+	chainState := chain.NewState(tmpFile.Name())
+	chainState.RebuildFromEvents([]nostr.Event{genesis, appendEvt, optOut})
+
+	if chainState.HasChain(chainID) {
+		t.Fatal("rebuild should leave chain dissolved after persisted opt-out event")
+	}
+}
+
+func TestStoreChainEventDoesNotAdvanceHeadOnStoreFailure(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "chain-state-*.json")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	chainState := chain.NewState(tmpFile.Name())
+	sk := nostr.Generate()
+	genesis := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"chain"}, {"d", "store-fail"}},
+		Content:   "genesis",
+	}
+	genesis.PubKey = sk.Public()
+	if err := genesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign genesis: %v", err)
+	}
+	chainID, ok := chain.GetChainID(genesis)
+	if !ok {
+		t.Fatal("expected chain id")
+	}
+
+	storeErr := fmt.Errorf("store failed")
+	if err := chainState.StoreChainEvent(genesis, func(nostr.Event) error {
+		return storeErr
+	}); err == nil {
+		t.Fatal("expected store error")
+	}
+	if chainState.HasChain(chainID) {
+		t.Fatal("chain state advanced even though storage failed")
+	}
+}
+
+func TestStoreOptOutDoesNotDissolveOnStoreFailure(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "chain-state-*.json")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	chainState := chain.NewState(tmpFile.Name())
+	sk := nostr.Generate()
+	genesis := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"chain"}, {"d", "opt-store-fail"}},
+		Content:   "genesis",
+	}
+	genesis.PubKey = sk.Public()
+	if err := genesis.Sign(sk); err != nil {
+		t.Fatalf("failed to sign genesis: %v", err)
+	}
+	chainID, accepted, msg := chainState.AcceptIfValid(genesis)
+	if !accepted {
+		t.Fatalf("genesis rejected: %s", msg)
+	}
+
+	optOut := nostr.Event{
+		Kind:      9001,
+		CreatedAt: nostr.Now() + 1,
+		Tags:      nostr.Tags{{"d", "opt-store-fail"}, {"prev", genesis.ID.Hex()}},
+		Content:   "opt out",
+	}
+	optOut.PubKey = sk.Public()
+	if err := optOut.Sign(sk); err != nil {
+		t.Fatalf("failed to sign opt-out: %v", err)
+	}
+
+	if _, err := chainState.StoreOptOutEvent(optOut, func(nostr.Event) error {
+		return fmt.Errorf("store failed")
+	}); err == nil {
+		t.Fatal("expected store error")
+	}
+	if !chainState.HasChain(chainID) {
+		t.Fatal("chain was dissolved even though opt-out storage failed")
+	}
+	if got := chainState.GetHead(chainID); got != genesis.ID.Hex() {
+		t.Fatalf("expected head to remain %s, got %s", genesis.ID.Hex(), got)
 	}
 }
 
