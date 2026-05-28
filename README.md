@@ -1,54 +1,71 @@
 # serial-killer
 
-A Nostr relay implementing **NIP-EC** — relay-enforced linear event chains.
+A Nostr relay implementing **[NIP-EC](https://github.com/pablof7z/serial-killer/blob/main/EC.md)** — relay-enforced linear event chains.
 
-**The problem:** Nostr clients that maintain ordered state (wallets, document history) have no way to prevent conflicting writes. Two clients can publish different "next states", and relays silently diverge.
+A relay-side mechanism that prevents concurrent or stale writes by requiring every event to chain off the last accepted one.
 
-**The fix:** Tag your events with `["chain"]` to opt in. The relay accepts a new event only if its `["prev"]` matches the current head. Stale writes are rejected. No silent forks.
-
----
-
-## Demo: divergence and recovery
-
-Start two relays (`just run-relays`), then run the interactive client (`just run-client`).
-
-### Connect, genesis, diverge
-
-Connect to both relays, publish a genesis event, disconnect one relay, append to only the first, then reconnect and try to append to both. The second relay rejects with `stale-prev` — it missed an event.
-
-![](.github/demo-1.png)
-
-`G` marks the genesis, `H` marks the current head. Relay-a has advanced to the third event; relay-b is still at the genesis.
-
-### Detect and fix
-
-`diverge` finds the last common event and shows which branch each relay is on. `fix` replays the missing events from the canonical relay onto the diverged one.
-
-![](.github/demo-2.png)
-
-Both relays are now in sync.
+**Scope:** don't mistake this for a global enforcement or ordering guarantee. This enforcement is exclusive to each individual relay. There is no global.
 
 ---
 
-## Chain event format
+## Demo
 
-**Genesis** (starts a chain):
-
-```json
-{
-  "tags": [["chain"], ["d", "wallet"]]
-}
+### Connect to two relays
+```bash
+> connect ws://127.0.0.1:3334
+> connect ws://127.0.0.1:3335
 ```
 
-**Append** (extends the chain):
-
-```json
-{
-  "tags": [["chain"], ["d", "wallet"], ["prev", "<current-head-id>"]]
-}
+### Publish the first event in the chain to both
+```bash
+> genesis kind=1 First balance state
+Publishing event 5bd13a90dd314c19... to 2 relay(s)...
+  [ws://127.0.0.1:3334] OK
+  [ws://127.0.0.1:3335] OK
 ```
 
-If no `["d"]` tag is present, the chain name defaults to the event kind as a string.
+### Disconnect one relay and advance the chain without it
+```bash
+> disconnect ws://127.0.0.1:3335
+> append kind=1 Second state
+Publishing event e03059ac16d3250f... to 1 relay(s)...
+  [ws://127.0.0.1:3334] OK
+```
+
+### Reconnect — the stale relay rejects the next append
+```bash
+> connect ws://127.0.0.1:3335
+> append kind=1 Third state
+Publishing event 31796b5c22203926... to 2 relay(s)...
+  [ws://127.0.0.1:3335] FAILED: msg: invalid: chain:stale-prev current=5bd13a90dd314c19...
+  [ws://127.0.0.1:3334] OK
+```
+
+### Detect and fix the divergence
+```bash
+> diverge 1
+DIVERGENCE between ws://127.0.0.1:3334 and ws://127.0.0.1:3335
+  Last common: 5bd13a90dd314c19...
+  Branch A: e03059ac16d3250f... -> 31796b5c22203926...
+
+> fix ws://127.0.0.1:3335 1 ws://127.0.0.1:3334
+Replaying 2 event(s) to target relay...
+  Replayed e03059ac16d3250f...
+  Replayed 31796b5c22203926...
+Done.
+```
+
+---
+
+Any kind works. Here's a kind-3 contact list chained via `nak`:
+
+```bash
+$ nak event -k 3 -t chain -p fa984bd7... ec1.f7z.io
+publishing to ec1.f7z.io... success.
+
+$ nak event -k 3 -p fa984bd7... ec1.f7z.io
+publishing to ec1.f7z.io... failed: msg: invalid: chain:missing-prev 444037895ad02e3e...
+```
 
 ## Opting out
 

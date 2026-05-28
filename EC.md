@@ -6,6 +6,8 @@
 
 This NIP defines an opt-in mechanism for relay-enforced linear event chains.
 
+Don't mistake this NIP for a global enforcement or ordering guarantee. This enforcement is exclusive to each individual relay. There is no global.
+
 ```
 accept event iff prev == current known state
 ```
